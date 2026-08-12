@@ -29,6 +29,8 @@ const systemRoutes = require('./modules/system/system.routes');
 const bannerRoutes = require('./modules/banners/banner.routes');
 const recommendationRoutes = require('./modules/products/recommendation.routes');
 const stripeRoutes = require('./modules/payments/stripe.routes');
+const jazzcashRoutes = require('./modules/payments/jazzcash.routes');
+const easypaisaRoutes = require('./modules/payments/easypaisa.routes');
 const app = express();
 
 // Global middlewares
@@ -62,6 +64,8 @@ app.use('/api/orders', orderRoutes);
 app.use('/api/promotions', promotionRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/stripe', stripeRoutes);
+app.use('/api/jazzcash', jazzcashRoutes);
+app.use('/api/easypaisa', easypaisaRoutes);
 app.use('/api/shipping', shippingRoutes);
 app.use('/api/reviews', reviewRoutes);
 app.use('/api/refunds', refundRoutes);

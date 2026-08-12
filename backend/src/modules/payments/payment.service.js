@@ -1,19 +1,27 @@
 // Orchestrates the full payment initiation flow: server-side amount
 // calculation, ownership checks, idempotency, risk assessment, and
 // deciding whether to go straight to the gateway or require OTP first.
+// Supports multiple gateways (Stripe, JazzCash, EasyPaisa) via a single
+// dispatch point (createGatewayCheckout) - Stripe logic is UNCHANGED.
 const crypto = require('crypto');
 const { query, getClient } = require('../../config/db');
 const { assessRisk } = require('./riskAssessment.service');
 const stripe = require('../../config/stripe');
+const jazzcashService = require('./jazzcash.service');
+const easypaisaService = require('./easypaisa.service');
 
-// Initiates a payment for an order. Idempotent: if a pending payment already
-// exists for this order, it is reused instead of creating a duplicate.
-async function initiatePayment({ userId, orderId, deviceId }) {
+// Maps our internal payment_method value to payment_gateways.code
+const GATEWAY_CODE_BY_METHOD = {
+  card: 'stripe',
+  jazzcash: 'jazzcash',
+  easypaisa: 'easypaisa',
+};
+
+async function initiatePayment({ userId, orderId, deviceId, paymentMethod }) {
   const client = await getClient();
   try {
     await client.query('BEGIN');
 
-    // 1. Verify the order belongs to this authenticated user (never trust the client)
     const orderResult = await client.query(
       `SELECT * FROM orders WHERE id = $1 AND user_id = $2 FOR UPDATE`,
       [orderId, userId]
@@ -24,10 +32,8 @@ async function initiatePayment({ userId, orderId, deviceId }) {
     }
     const order = orderResult.rows[0];
 
-    // 2. Server-side amount - always trust the database, never a client-supplied value
     const orderAmount = parseFloat(order.total_amount);
 
-    // 3. Idempotency: check for an existing non-failed payment for this order
     const existingPaymentResult = await client.query(
       `SELECT * FROM payments WHERE order_id = $1 AND status IN ('pending', 'completed') ORDER BY created_at DESC LIMIT 1`,
       [orderId]
@@ -39,35 +45,33 @@ async function initiatePayment({ userId, orderId, deviceId }) {
         await client.query('ROLLBACK');
         throw { status: 409, message: 'This order has already been paid for' };
       }
-      // Reuse the existing pending payment rather than creating a duplicate
       await client.query('COMMIT');
       return resumeExistingPayment(existing, userId, orderId, deviceId);
     }
 
-    // 4. Run risk assessment - pass `client` so every query it runs (including
-    // the audit INSERT into payment_risk_assessments) shares this same
-    // transaction/connection. This avoids a self-lock against the FOR UPDATE
-    // held above on the orders row (previously a different pooled connection
-    // would block waiting on this same transaction to commit).
     const riskResult = await assessRisk({ userId, orderId, orderAmount, deviceId, client });
 
-    // 5. Create the payment record
-    const gatewayResult = await client.query(`SELECT id FROM payment_gateways WHERE code = 'stripe'`);
+    const gatewayCode = GATEWAY_CODE_BY_METHOD[paymentMethod];
+    if (!gatewayCode) {
+      await client.query('ROLLBACK');
+      throw { status: 400, message: 'Unsupported payment method' };
+    }
+    const gatewayResult = await client.query(`SELECT id FROM payment_gateways WHERE code = $1`, [gatewayCode]);
     const gatewayId = gatewayResult.rows[0]?.id || null;
     const idempotencyKey = crypto.randomUUID();
 
     const paymentResult = await client.query(
       `INSERT INTO payments (order_id, payment_gateway_id, transaction_reference, amount, status, payment_method, requires_verification, idempotency_key)
-       VALUES ($1, $2, $3, $4, 'pending', 'card', $5, $6)
+       VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7)
        RETURNING *`,
-      [orderId, gatewayId, `PENDING-${idempotencyKey}`, orderAmount, riskResult.requiresVerification, idempotencyKey]
+      [orderId, gatewayId, `PENDING-${idempotencyKey}`, orderAmount, paymentMethod, riskResult.requiresVerification, idempotencyKey]
     );
     const payment = paymentResult.rows[0];
 
     await client.query('COMMIT');
 
     if (riskResult.requiresVerification) {
-      // High risk: do NOT create the Stripe PaymentIntent yet. Wait for OTP first.
+      // High risk: do NOT hit the gateway yet. Wait for OTP first.
       return {
         paymentId: payment.id,
         requiresVerification: true,
@@ -75,13 +79,13 @@ async function initiatePayment({ userId, orderId, deviceId }) {
       };
     }
 
-    // Low/medium risk (not requiring verification): proceed straight to the gateway
-    const clientSecret = await createStripeIntentForPayment(payment, order);
+    const gatewayResponse = await createGatewayCheckout(paymentMethod, payment, order);
     return {
       paymentId: payment.id,
       requiresVerification: false,
       riskLevel: riskResult.riskLevel,
-      clientSecret,
+      gateway: paymentMethod,
+      ...gatewayResponse,
     };
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) { /* already rolled back */ }
@@ -91,26 +95,45 @@ async function initiatePayment({ userId, orderId, deviceId }) {
   }
 }
 
-// If a pending payment already exists for this order (e.g. user refreshed
-// the page mid-flow), resume it instead of creating a duplicate.
 async function resumeExistingPayment(payment, userId, orderId, deviceId) {
+  const orderResult = await query(`SELECT * FROM orders WHERE id = $1`, [orderId]);
+  const order = orderResult.rows[0];
+
   if (payment.requires_verification) {
     const { isPaymentVerified } = require('./otp.service');
     const verified = await isPaymentVerified(payment.id);
     if (verified) {
-      const orderResult = await query(`SELECT * FROM orders WHERE id = $1`, [orderId]);
-      const clientSecret = await createStripeIntentForPayment(payment, orderResult.rows[0]);
-      return { paymentId: payment.id, requiresVerification: false, clientSecret, resumed: true };
+      const gatewayResponse = await createGatewayCheckout(payment.payment_method, payment, order);
+      return { paymentId: payment.id, requiresVerification: false, gateway: payment.payment_method, resumed: true, ...gatewayResponse };
     }
     return { paymentId: payment.id, requiresVerification: true, resumed: true };
   }
 
-  const orderResult = await query(`SELECT * FROM orders WHERE id = $1`, [orderId]);
-  const clientSecret = await createStripeIntentForPayment(payment, orderResult.rows[0]);
-  return { paymentId: payment.id, requiresVerification: false, clientSecret, resumed: true };
+  const gatewayResponse = await createGatewayCheckout(payment.payment_method, payment, order);
+  return { paymentId: payment.id, requiresVerification: false, gateway: payment.payment_method, resumed: true, ...gatewayResponse };
 }
 
-// Creates (or reuses) the Stripe PaymentIntent for an already-created payment record
+// Single dispatch point. Adding a 4th gateway later = one more `if` block
+// here + its own service file - nothing else in this file changes.
+async function createGatewayCheckout(paymentMethod, payment, order) {
+  if (paymentMethod === 'card') {
+    const clientSecret = await createStripeIntentForPayment(payment, order);
+    return { clientSecret };
+  }
+  if (paymentMethod === 'jazzcash') {
+    const { fields, txnRefNo, actionUrl } = jazzcashService.buildHostedCheckoutFields({ payment, order });
+    await query(`UPDATE payments SET transaction_reference = $1 WHERE id = $2`, [txnRefNo, payment.id]);
+    return { redirect: { actionUrl, fields } };
+  }
+  if (paymentMethod === 'easypaisa') {
+    const { fields, orderRefNum, actionUrl } = easypaisaService.buildHostedCheckoutFields({ payment, order });
+    await query(`UPDATE payments SET transaction_reference = $1 WHERE id = $2`, [orderRefNum, payment.id]);
+    return { redirect: { actionUrl, fields } };
+  }
+  throw { status: 400, message: 'Unsupported payment method' };
+}
+
+// UNCHANGED - Stripe logic exactly as before
 async function createStripeIntentForPayment(payment, order) {
   if (payment.gateway_payment_intent_id) {
     const existingIntent = await stripe.paymentIntents.retrieve(payment.gateway_payment_intent_id);
@@ -125,7 +148,7 @@ async function createStripeIntentForPayment(payment, order) {
     metadata: { order_id: String(order.id), payment_id: String(payment.id) },
     automatic_payment_methods: { enabled: true },
   }, {
-    idempotencyKey: payment.idempotency_key, // prevents Stripe-side duplicate charges too
+    idempotencyKey: payment.idempotency_key,
   });
 
   await query(
@@ -136,10 +159,9 @@ async function createStripeIntentForPayment(payment, order) {
   return paymentIntent.client_secret;
 }
 
-// Called once OTP verification succeeds - now safe to create the Stripe intent
 async function proceedAfterVerification(paymentId, userId) {
   const paymentResult = await query(
-    `SELECT p.*, o.total_amount, o.id AS order_id, o.user_id
+    `SELECT p.*, o.total_amount, o.id AS order_id, o.user_id, o.order_number
      FROM payments p JOIN orders o ON o.id = p.order_id
      WHERE p.id = $1`,
     [paymentId]
@@ -163,12 +185,10 @@ async function proceedAfterVerification(paymentId, userId) {
     throw { status: 403, message: 'OTP verification has not been completed for this payment' };
   }
 
-  const clientSecret = await createStripeIntentForPayment(payment, {
-    id: payment.order_id,
-    total_amount: payment.total_amount,
-  });
+  const order = { id: payment.order_id, total_amount: payment.total_amount, order_number: payment.order_number };
+  const gatewayResponse = await createGatewayCheckout(payment.payment_method, payment, order);
 
-  return clientSecret;
+  return { gateway: payment.payment_method, ...gatewayResponse };
 }
 
 module.exports = { initiatePayment, proceedAfterVerification };

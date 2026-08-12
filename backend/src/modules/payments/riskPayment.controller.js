@@ -9,16 +9,23 @@ const otpService = require('./otp.service');
 // initiates payment, running risk assessment to decide the flow.
 async function initiatePayment(req, res, next) {
   try {
-    const { order_id } = req.body;
+    const { order_id, payment_method } = req.body;
     if (!order_id) return ApiResponse.error(res, 'order_id is required', 400);
+    if (!payment_method) return ApiResponse.error(res, 'payment_method is required', 400);
+
+    const allowedMethods = ['card', 'jazzcash', 'easypaisa'];
+    if (!allowedMethods.includes(payment_method)) {
+      return ApiResponse.error(res, 'Invalid payment_method', 400);
+    }
 
     const result = await paymentService.initiatePayment({
       userId: req.user.id,
       orderId: order_id,
       deviceId: req.deviceId,
+      paymentMethod: payment_method,
     });
 
-    if (result.requiresVerification) {
+     if (result.requiresVerification) {
       const contactOptions = await otpService.getMaskedContactOptions(req.user.id);
       return ApiResponse.success(res, {
         payment_id: result.paymentId,
@@ -30,14 +37,15 @@ async function initiatePayment(req, res, next) {
     return ApiResponse.success(res, {
       payment_id: result.paymentId,
       requires_verification: false,
-      client_secret: result.clientSecret,
+      gateway: result.gateway,
+      client_secret: result.clientSecret || null,
+      redirect: result.redirect || null,
     }, 'Payment initiated');
   } catch (err) {
     if (err.status) return ApiResponse.error(res, err.message, err.status);
     next(err);
   }
 }
-
 // Sends an OTP to the customer's chosen, already-verified contact method
 async function sendOtp(req, res, next) {
   try {
